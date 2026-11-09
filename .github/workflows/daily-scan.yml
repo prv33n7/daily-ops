@@ -1,0 +1,71 @@
+name: Daily ECR Secret Scan
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 2:00 AM UTC daily
+  workflow_dispatch:        # allow manual trigger
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360    # 6-hour max
+
+    steps:
+      # ── 1. Checkout private scanner repo ────────────────────────────────────
+      - name: Checkout scanner core (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}     # e.g. youruser/ecr-scanner-core
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: core
+
+      # ── 2. Install tools ─────────────────────────────────────────────────────
+      - name: Install Python deps
+        run: pip install requests --quiet
+
+      - name: Install trufflehog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            | sh -s -- -b /usr/local/bin
+          trufflehog --version
+
+      # ── 3. Fetch delta (new images since last run) ───────────────────────────
+      - name: Fetch new ECR images
+        id: delta
+        run: |
+          python3 -I core/daily/fetch_delta.py > /tmp/new_images.txt
+          COUNT=$(wc -l < /tmp/new_images.txt | tr -d ' ')
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "New images: $COUNT"
+
+      # ── 4. Scan (skip if no new images) ──────────────────────────────────────
+      - name: Scan new images
+        if: steps.delta.outputs.count != '0'
+        run: |
+          python3 -I core/daily/scan_delta.py \
+            --input   /tmp/new_images.txt \
+            --db      /tmp/daily_findings.db \
+            --out     /tmp/daily_findings.csv \
+            --workers 4 \
+            --timeout 300
+
+      - name: Create empty CSV if nothing to scan
+        if: steps.delta.outputs.count == '0'
+        run: echo "image,detector,file_path,layer,raw,found_at" > /tmp/daily_findings.csv
+
+      # ── 5. Notify Slack ───────────────────────────────────────────────────────
+      - name: Notify Slack
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: python3 -I core/daily/notify_slack.py /tmp/daily_findings.csv
+
+      # ── 6. Commit updated known_images.txt back to private repo ──────────────
+      - name: Commit state update
+        if: steps.delta.outputs.count != '0'
+        run: |
+          cd core
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/known_images.txt
+          git diff --cached --quiet || git commit -m "chore: update known_images [$(date -u +%Y-%m-%d)]"
+          git push
