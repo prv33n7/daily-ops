@@ -9,8 +9,9 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.split.outputs.matrix }}
-      count:  ${{ steps.sync.outputs.count }}
+      matrix:   ${{ steps.split.outputs.matrix }}
+      count:    ${{ steps.sync.outputs.count }}
+      scanned:  ${{ steps.sync.outputs.count }}
 
     steps:
       - name: Prepare workspace
@@ -166,4 +167,4 @@ jobs:
           EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO:       ${{ secrets.EMAIL_TO }}
-        run: python3 -I core/daily/notify_email.py /tmp/daily_findings.csv
+        run: python3 -I core/daily/notify_email.py /tmp/daily_findings.csv ${{ needs.setup.outputs.scanned }}
