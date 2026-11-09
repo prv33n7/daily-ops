@@ -12,6 +12,7 @@ jobs:
       matrix:   ${{ steps.split.outputs.matrix }}
       count:    ${{ steps.sync.outputs.count }}
       scanned:  ${{ steps.sync.outputs.count }}
+      rundate:  ${{ steps.split.outputs.rundate }}
 
     steps:
       - name: Prepare workspace
@@ -41,22 +42,27 @@ jobs:
       - name: Prepare jobs
         id: split
         run: |
-          python3 -I - <<'EOF'
+          RUNDATE=$(date -u +%Y-%m-%d)
+          echo "rundate=$RUNDATE" >> $GITHUB_OUTPUT
+          RUNDATE="$RUNDATE" python3 -I - <<'EOF'
           import json, math, os
           from pathlib import Path
 
           txt = Path('/tmp/items.txt').read_text().strip()
           images = txt.splitlines() if txt else []
           n = len(images)
+          rundate = os.environ['RUNDATE']
 
           chunks = min(8, max(1, math.ceil(n / 2000))) if n > 0 else 1
           size   = math.ceil(n / chunks) if n > 0 else 1
 
-          os.makedirs('/tmp/chunks', exist_ok=True)
+          chunk_dir = Path('core') / 'run-data' / rundate / 'chunks'
+          chunk_dir.mkdir(parents=True, exist_ok=True)
+
           include = []
           for i in range(chunks):
               batch = images[i*size:(i+1)*size]
-              Path(f'/tmp/chunks/chunk-{i}.txt').write_text('\n'.join(batch))
+              (chunk_dir / f'chunk-{i}.txt').write_text('\n'.join(batch))
               include.append({'chunk': i})
 
           matrix = json.dumps({'include': include})
@@ -64,12 +70,15 @@ jobs:
               f.write(f'matrix={matrix}\n')
           EOF
 
-      - name: Cache data
-        uses: actions/upload-artifact@v4
-        with:
-          name: data-chunks
-          path: /tmp/chunks/
-          retention-days: 1
+      - name: Store chunks in private repo
+        if: steps.sync.outputs.count != '0'
+        run: |
+          cd core
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add run-data/
+          git diff --cached --quiet || git commit -m "run: store chunks [$(date -u +%Y-%m-%d)]"
+          git push
 
   process:
     needs: setup
@@ -94,28 +103,37 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
             | sh -s -- -b /usr/local/bin
 
-      - name: Restore cache
-        uses: actions/download-artifact@v4
-        with:
-          name: data-chunks
-          path: /tmp/chunks
-
       - name: Run checks (${{ matrix.chunk }})
         run: |
           python3 -I core/daily/scan_delta.py \
-            --input   /tmp/chunks/chunk-${{ matrix.chunk }}.txt \
+            --input   core/run-data/${{ needs.setup.outputs.rundate }}/chunks/chunk-${{ matrix.chunk }}.txt \
             --db      /tmp/results-${{ matrix.chunk }}.db \
             --out     /tmp/results-${{ matrix.chunk }}.csv \
             --workers 4 \
             --timeout 300
 
-      - name: Save results
+      - name: Save results to private repo
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: results-${{ matrix.chunk }}
-          path: /tmp/results-${{ matrix.chunk }}.csv
-          retention-days: 90
+        run: |
+          RUNDATE="${{ needs.setup.outputs.rundate }}"
+          CHUNK="${{ matrix.chunk }}"
+          cd core
+          mkdir -p "run-data/$RUNDATE/findings"
+          if [ -f "/tmp/results-${CHUNK}.csv" ]; then
+            cp "/tmp/results-${CHUNK}.csv" "run-data/$RUNDATE/findings/chunk-${CHUNK}.csv"
+          else
+            touch "run-data/$RUNDATE/findings/chunk-${CHUNK}.csv"
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin "$BRANCH" || true
+            git add "run-data/$RUNDATE/findings/chunk-${CHUNK}.csv"
+            git diff --cached --quiet && { echo "Nothing to commit"; break; }
+            git commit -m "findings: chunk-${CHUNK} [$RUNDATE]" && git push && break
+            sleep $i
+          done
 
   report:
     needs: [setup, process]
@@ -130,28 +148,22 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           path: core
 
-      - name: Collect results
-        id: dl
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: results-*
-          path: /tmp/results
-          merge-multiple: false
-
       - name: Aggregate results
+        env:
+          RUNDATE: ${{ needs.setup.outputs.rundate }}
         run: |
           python3 -I - <<'EOF'
-          import csv, glob
+          import csv, glob, os
           from pathlib import Path
 
+          rundate = os.environ['RUNDATE']
           header = ['image','detector','file_path','layer','raw','found_at']
           out = open('/tmp/daily_findings.csv', 'w', newline='')
           writer = csv.DictWriter(out, fieldnames=header)
           writer.writeheader()
 
           total = 0
-          for f in sorted(glob.glob('/tmp/results/results-*/results-*.csv')):
+          for f in sorted(glob.glob(f'core/run-data/{rundate}/findings/chunk-*.csv')):
               try:
                   for row in csv.DictReader(open(f)):
                       writer.writerow(row)
@@ -173,3 +185,16 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO:       ${{ secrets.EMAIL_TO }}
         run: python3 -I core/daily/notify_email.py /tmp/triage.json ${{ needs.setup.outputs.scanned }}
+
+      - name: Cleanup run data
+        if: always()
+        run: |
+          RUNDATE="${{ needs.setup.outputs.rundate }}"
+          cd core
+          if [ -d "run-data/$RUNDATE" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git rm -rf "run-data/$RUNDATE/"
+            git diff --cached --quiet || git commit -m "cleanup: run-data [$RUNDATE]"
+            git push || (git pull --rebase && git push) || true
+          fi
