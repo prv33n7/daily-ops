@@ -162,9 +162,14 @@ jobs:
           print(f'Total: {total}')
           EOF
 
+      - name: AI triage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 -I core/daily/ai_triage.py /tmp/daily_findings.csv /tmp/triage.json
+
       - name: Send report
         env:
           EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO:       ${{ secrets.EMAIL_TO }}
-        run: python3 -I core/daily/notify_email.py /tmp/daily_findings.csv ${{ needs.setup.outputs.scanned }}
+        run: python3 -I core/daily/notify_email.py /tmp/triage.json ${{ needs.setup.outputs.scanned }}
