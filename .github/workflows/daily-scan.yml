@@ -3,33 +3,24 @@ name: Daily ECR Secret Scan
 on:
   schedule:
     - cron: '0 2 * * *'   # 2:00 AM UTC daily
-  workflow_dispatch:        # allow manual trigger
+  workflow_dispatch:
 
 jobs:
-  scan:
+  # ── Job 1: fetch delta, commit state, split into chunks ──────────────────
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 360    # 6-hour max
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+      count:  ${{ steps.delta.outputs.count }}
 
     steps:
-      # ── 1. Checkout private scanner repo ────────────────────────────────────
       - name: Checkout scanner core (private)
         uses: actions/checkout@v4
         with:
-          repository: ${{ secrets.PRIVATE_REPO }}     # e.g. youruser/ecr-scanner-core
+          repository: ${{ secrets.PRIVATE_REPO }}
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           path: core
 
-      # ── 2. Install tools ─────────────────────────────────────────────────────
-      - name: Install Python deps
-        run: pip install requests --quiet
-
-      - name: Install trufflehog
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
-            | sh -s -- -b /usr/local/bin
-          trufflehog --version
-
-      # ── 3. Fetch delta (new images since last run) ───────────────────────────
       - name: Fetch new ECR images
         id: delta
         run: |
@@ -38,29 +29,8 @@ jobs:
           echo "count=$COUNT" >> $GITHUB_OUTPUT
           echo "New images: $COUNT"
 
-      # ── 4. Scan (skip if no new images) ──────────────────────────────────────
-      - name: Scan new images
-        if: steps.delta.outputs.count != '0'
-        run: |
-          python3 -I core/daily/scan_delta.py \
-            --input   /tmp/new_images.txt \
-            --db      /tmp/daily_findings.db \
-            --out     /tmp/daily_findings.csv \
-            --workers 4 \
-            --timeout 300
-
-      - name: Create empty CSV if nothing to scan
-        if: steps.delta.outputs.count == '0'
-        run: echo "image,detector,file_path,layer,raw,found_at" > /tmp/daily_findings.csv
-
-      # ── 5. Notify Slack ───────────────────────────────────────────────────────
-      - name: Notify Slack
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-        run: python3 -I core/daily/notify_slack.py /tmp/daily_findings.csv
-
-      # ── 6. Commit updated known_images.txt back to private repo ──────────────
-      - name: Commit state update
+      # Commit state BEFORE scanning — if scan times out, next run won't re-process
+      - name: Commit state to private repo
         if: steps.delta.outputs.count != '0'
         run: |
           cd core
@@ -70,3 +40,134 @@ jobs:
           git diff --cached --quiet || git commit -m "chore: update known_images [$(date -u +%Y-%m-%d)]"
           git push
 
+      # Split image list into chunks; 1 chunk per 2000 images, max 8
+      - name: Split images into chunks
+        id: split
+        run: |
+          python3 -I - <<'EOF'
+          import json, math, os
+          from pathlib import Path
+
+          txt = Path('/tmp/new_images.txt').read_text().strip()
+          images = txt.splitlines() if txt else []
+          n = len(images)
+
+          chunks = min(8, max(1, math.ceil(n / 2000))) if n > 0 else 1
+          size   = math.ceil(n / chunks) if n > 0 else 1
+
+          os.makedirs('/tmp/chunks', exist_ok=True)
+          include = []
+          for i in range(chunks):
+              batch = images[i*size:(i+1)*size]
+              Path(f'/tmp/chunks/chunk-{i}.txt').write_text('\n'.join(batch))
+              include.append({'chunk': i})
+
+          matrix = json.dumps({'include': include})
+          print(f'n={n}  chunks={chunks}  size≈{size}  matrix={matrix}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'matrix={matrix}\n')
+          EOF
+
+      - name: Upload chunks
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-chunks
+          path: /tmp/chunks/
+          retention-days: 1
+
+  # ── Job 2: scan (parallel per chunk) ─────────────────────────────────────
+  scan:
+    needs: prepare
+    if: needs.prepare.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      matrix:        ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast:     false   # one chunk failing doesn't cancel others
+
+    steps:
+      - name: Checkout scanner core (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: core
+
+      - name: Install trufflehog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Download image chunks
+        uses: actions/download-artifact@v4
+        with:
+          name: image-chunks
+          path: /tmp/chunks
+
+      - name: Scan chunk ${{ matrix.chunk }}
+        run: |
+          python3 -I core/daily/scan_delta.py \
+            --input   /tmp/chunks/chunk-${{ matrix.chunk }}.txt \
+            --db      /tmp/findings-${{ matrix.chunk }}.db \
+            --out     /tmp/findings-${{ matrix.chunk }}.csv \
+            --workers 4 \
+            --timeout 300
+
+      - name: Upload findings for chunk ${{ matrix.chunk }}
+        if: always()   # upload even if scan timed out partway
+        uses: actions/upload-artifact@v4
+        with:
+          name: findings-chunk-${{ matrix.chunk }}
+          path: /tmp/findings-${{ matrix.chunk }}.csv
+          retention-days: 90
+
+  # ── Job 3: merge findings + notify Slack ─────────────────────────────────
+  notify:
+    needs: [prepare, scan]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout scanner core (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: core
+
+      - name: Download all findings
+        id: dl
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: findings-chunk-*
+          path: /tmp/findings
+          merge-multiple: false
+
+      - name: Merge findings CSVs
+        run: |
+          python3 -I - <<'EOF'
+          import csv, glob, os
+          from pathlib import Path
+
+          header = ['image','detector','file_path','layer','raw','found_at']
+          out = open('/tmp/daily_findings.csv', 'w', newline='')
+          writer = csv.DictWriter(out, fieldnames=header)
+          writer.writeheader()
+
+          total = 0
+          for f in sorted(glob.glob('/tmp/findings/findings-chunk-*/findings-*.csv')):
+              try:
+                  for row in csv.DictReader(open(f)):
+                      writer.writerow(row)
+                      total += 1
+              except Exception as e:
+                  print(f'warn: {f}: {e}')
+          out.close()
+          print(f'Merged {total} findings from chunks')
+          EOF
+
+      - name: Notify Slack
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: python3 -I core/daily/notify_slack.py /tmp/daily_findings.csv
