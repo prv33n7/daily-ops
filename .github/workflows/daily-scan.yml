@@ -1,54 +1,50 @@
-name: Daily ECR Secret Scan
+name: Scheduled Maintenance
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # 2:00 AM UTC daily
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 jobs:
-  # ── Job 1: fetch delta, commit state, split into chunks ──────────────────
-  prepare:
+  setup:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.split.outputs.matrix }}
-      count:  ${{ steps.delta.outputs.count }}
+      count:  ${{ steps.sync.outputs.count }}
 
     steps:
-      - name: Checkout scanner core (private)
+      - name: Prepare workspace
         uses: actions/checkout@v4
         with:
           repository: ${{ secrets.PRIVATE_REPO }}
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           path: core
 
-      - name: Fetch new ECR images
-        id: delta
+      - name: Sync data
+        id: sync
         run: |
-          python3 -I core/daily/fetch_delta.py > /tmp/new_images.txt
-          COUNT=$(wc -l < /tmp/new_images.txt | tr -d ' ')
+          python3 -I core/daily/fetch_delta.py > /tmp/items.txt
+          COUNT=$(wc -l < /tmp/items.txt | tr -d ' ')
           echo "count=$COUNT" >> $GITHUB_OUTPUT
-          echo "New images: $COUNT"
 
-      # Commit state BEFORE scanning — if scan times out, next run won't re-process
-      - name: Commit state to private repo
-        if: steps.delta.outputs.count != '0'
+      - name: Update state
+        if: steps.sync.outputs.count != '0'
         run: |
           cd core
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state/known_images.txt
-          git diff --cached --quiet || git commit -m "chore: update known_images [$(date -u +%Y-%m-%d)]"
+          git diff --cached --quiet || git commit -m "chore: state update [$(date -u +%Y-%m-%d)]"
           git push
 
-      # Split image list into chunks; 1 chunk per 2000 images, max 8
-      - name: Split images into chunks
+      - name: Prepare jobs
         id: split
         run: |
           python3 -I - <<'EOF'
           import json, math, os
           from pathlib import Path
 
-          txt = Path('/tmp/new_images.txt').read_text().strip()
+          txt = Path('/tmp/items.txt').read_text().strip()
           images = txt.splitlines() if txt else []
           n = len(images)
 
@@ -63,91 +59,89 @@ jobs:
               include.append({'chunk': i})
 
           matrix = json.dumps({'include': include})
-          print(f'n={n}  chunks={chunks}  size≈{size}  matrix={matrix}')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f'matrix={matrix}\n')
           EOF
 
-      - name: Upload chunks
+      - name: Cache data
         uses: actions/upload-artifact@v4
         with:
-          name: image-chunks
+          name: data-chunks
           path: /tmp/chunks/
           retention-days: 1
 
-  # ── Job 2: scan (parallel per chunk) ─────────────────────────────────────
-  scan:
-    needs: prepare
-    if: needs.prepare.outputs.count != '0'
+  process:
+    needs: setup
+    if: needs.setup.outputs.count != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
-      matrix:        ${{ fromJson(needs.prepare.outputs.matrix) }}
-      fail-fast:     false   # one chunk failing doesn't cancel others
+      matrix:    ${{ fromJson(needs.setup.outputs.matrix) }}
+      fail-fast: false
 
     steps:
-      - name: Checkout scanner core (private)
+      - name: Prepare workspace
         uses: actions/checkout@v4
         with:
           repository: ${{ secrets.PRIVATE_REPO }}
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           path: core
 
-      - name: Install trufflehog
+      - name: Install dependencies
         run: |
+          pip install requests --quiet
           curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
             | sh -s -- -b /usr/local/bin
 
-      - name: Download image chunks
+      - name: Restore cache
         uses: actions/download-artifact@v4
         with:
-          name: image-chunks
+          name: data-chunks
           path: /tmp/chunks
 
-      - name: Scan chunk ${{ matrix.chunk }}
+      - name: Run checks (${{ matrix.chunk }})
         run: |
           python3 -I core/daily/scan_delta.py \
             --input   /tmp/chunks/chunk-${{ matrix.chunk }}.txt \
-            --db      /tmp/findings-${{ matrix.chunk }}.db \
-            --out     /tmp/findings-${{ matrix.chunk }}.csv \
+            --db      /tmp/results-${{ matrix.chunk }}.db \
+            --out     /tmp/results-${{ matrix.chunk }}.csv \
             --workers 4 \
             --timeout 300
 
-      - name: Upload findings for chunk ${{ matrix.chunk }}
-        if: always()   # upload even if scan timed out partway
+      - name: Save results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: findings-chunk-${{ matrix.chunk }}
-          path: /tmp/findings-${{ matrix.chunk }}.csv
+          name: results-${{ matrix.chunk }}
+          path: /tmp/results-${{ matrix.chunk }}.csv
           retention-days: 90
 
-  # ── Job 3: merge findings + notify Slack ─────────────────────────────────
-  notify:
-    needs: [prepare, scan]
-    if: always() && needs.prepare.result == 'success'
+  report:
+    needs: [setup, process]
+    if: always() && needs.setup.result == 'success'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout scanner core (private)
+      - name: Prepare workspace
         uses: actions/checkout@v4
         with:
           repository: ${{ secrets.PRIVATE_REPO }}
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           path: core
 
-      - name: Download all findings
+      - name: Collect results
         id: dl
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          pattern: findings-chunk-*
-          path: /tmp/findings
+          pattern: results-*
+          path: /tmp/results
           merge-multiple: false
 
-      - name: Merge findings CSVs
+      - name: Aggregate results
         run: |
           python3 -I - <<'EOF'
-          import csv, glob, os
+          import csv, glob
           from pathlib import Path
 
           header = ['image','detector','file_path','layer','raw','found_at']
@@ -156,7 +150,7 @@ jobs:
           writer.writeheader()
 
           total = 0
-          for f in sorted(glob.glob('/tmp/findings/findings-chunk-*/findings-*.csv')):
+          for f in sorted(glob.glob('/tmp/results/results-*/results-*.csv')):
               try:
                   for row in csv.DictReader(open(f)):
                       writer.writerow(row)
@@ -164,10 +158,10 @@ jobs:
               except Exception as e:
                   print(f'warn: {f}: {e}')
           out.close()
-          print(f'Merged {total} findings from chunks')
+          print(f'Total: {total}')
           EOF
 
-      - name: Notify Slack
+      - name: Send report
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
         run: python3 -I core/daily/notify_slack.py /tmp/daily_findings.csv
