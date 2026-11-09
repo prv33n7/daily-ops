@@ -1,5 +1,8 @@
 name: test-email
-on: workflow_dispatch
+
+on:
+  workflow_dispatch:
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -10,27 +13,27 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO:       ${{ secrets.EMAIL_TO }}
         run: |
-          python3 -c "
-import smtplib, os
-from email.mime.text import MIMEText
+          python3 - <<'PYEOF'
+          import smtplib, os
+          from email.mime.text import MIMEText
 
-frm  = os.environ['EMAIL_FROM']
-to   = os.environ['EMAIL_TO']
-pwd  = os.environ['EMAIL_PASSWORD']
+          frm = os.environ['EMAIL_FROM']
+          to  = os.environ['EMAIL_TO']
+          pwd = os.environ['EMAIL_PASSWORD']
 
-msg = MIMEText('SMTP test from GitHub Actions — secrets are wired correctly.')
-msg['Subject'] = '[daily-ops] SMTP test'
-msg['From']    = frm
-msg['To']      = to
+          msg = MIMEText('SMTP test from GitHub Actions — secrets are wired correctly.')
+          msg['Subject'] = '[daily-ops] SMTP test'
+          msg['From']    = frm
+          msg['To']      = to
 
-try:
-    with smtplib.SMTP('smtp.gmail.com', 587) as s:
-        s.ehlo()
-        s.starttls()
-        s.login(frm, pwd)
-        s.sendmail(frm, [to], msg.as_string())
-    print('SUCCESS — email sent')
-except Exception as e:
-    print(f'FAILED: {e}')
-    raise
-"
+          try:
+              with smtplib.SMTP('smtp.gmail.com', 587) as s:
+                  s.ehlo()
+                  s.starttls()
+                  s.login(frm, pwd)
+                  s.sendmail(frm, [to], msg.as_string())
+              print('SUCCESS: email sent to', to)
+          except Exception as e:
+              print('FAILED:', e)
+              raise SystemExit(1)
+          PYEOF
